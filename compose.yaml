@@ -1,0 +1,188 @@
+# SDLDA lab stack
+#
+#   Core (always started):  app, nginx
+#   Profiles (opt-in):      cache | sql | nosql | queue | stream | lambda | all
+#   Tools (run on demand):  k6, npm
+#
+#   docker compose up -d                          -> core only
+#   docker compose --profile cache up -d          -> core + Redis
+#   docker compose --profile all up -d            -> everything
+#   docker compose run --rm k6 run /scripts/smoke.js
+#
+# Host ports can be changed without editing this file: copy .env.example to .env.
+
+name: sdlda
+
+services:
+  # ---------------------------------------------------------------- core
+  app:
+    build: ./app
+    init: true
+    environment:
+      PORT: 3000
+    # No published port: every request goes through the load balancer,
+    # which also lets us run several replicas (--scale app=3).
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./app/src
+          target: /usr/src/app/src
+        - action: rebuild
+          path: ./app/package.json
+
+  nginx:
+    image: nginx:1.30-alpine
+    ports:
+      - "${NGINX_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/nginx-health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------- cache
+  redis:
+    image: redis:8-alpine
+    profiles: [cache, all]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------- sql
+  postgres:
+    image: postgres:18-alpine
+    profiles: [sql, all]
+    environment:
+      POSTGRES_USER: sdlda
+      POSTGRES_PASSWORD: sdlda
+      POSTGRES_DB: sdlda
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql          # PostgreSQL 18+ layout
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sdlda -d sdlda"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  adminer:
+    image: adminer:5
+    profiles: [sql, all]
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- nosql
+  mongo:
+    image: mongo:8.0
+    profiles: [nosql, all]
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------- queue
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    profiles: [queue, all]
+    environment:
+      RABBITMQ_DEFAULT_USER: sdlda
+      RABBITMQ_DEFAULT_PASS: sdlda
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ---------------------------------------------------------------- stream
+  kafka:
+    image: apache/kafka:4.3.1
+    profiles: [stream, all]
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    environment:
+      # Single node acting as both broker and controller (KRaft, no ZooKeeper)
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw   # any base64-encoded UUID
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # INTERNAL: other containers use kafka:29092; EXTERNAL: your host uses localhost:9092
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------- serverless
+  lambda:
+    build: ./lambda
+    profiles: [lambda, all]
+    ports:
+      - "${LAMBDA_PORT:-9000}:8080"
+
+  # ---------------------------------------------------------------- tools
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: [tools]
+    volumes:
+      - ./k6:/scripts:ro
+    environment:
+      BASE_URL: http://nginx
+
+  # npm without installing Node.js on your machine:
+  #   docker compose run --rm npm install <package>
+  npm:
+    image: node:24-alpine
+    profiles: [tools]
+    user: node
+    working_dir: /usr/src/app
+    volumes:
+      - ./app:/usr/src/app
+    entrypoint: ["npm"]
+
+volumes:
+  pgdata:
+  mongodata:

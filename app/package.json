@@ -1,0 +1,17 @@
+{
+  "name": "sdlda-app",
+  "version": "1.0.0",
+  "description": "SDLDA semester project - baseline service",
+  "private": true,
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

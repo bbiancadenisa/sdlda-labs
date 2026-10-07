@@ -1,0 +1,7 @@
+# Force LF line endings in the repository and in checkouts on every OS.
+# CRLF line endings (Windows default) break shell scripts and configs inside Linux containers.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
